@@ -1,5 +1,8 @@
-use std::{fmt::Debug, iter::Rev, mem::size_of, ops::{Deref, Index, IndexMut, RangeBounds, Sub}, result, slice::SliceIndex};
+use std::{borrow::Borrow, cmp::Ordering, collections::HashSet, fmt::Debug, iter::Rev, mem::size_of, ops::{Deref, Index, IndexMut, Range, RangeBounds, Sub}, process::abort, result, slice::SliceIndex};
 use byteorder::ByteOrder;
+use rand::{distributions::Alphanumeric, thread_rng, Rng};
+
+use proptest::{prelude::prop, prop_compose, strategy::{Just, Strategy}};
 
 /// Create a compile time array of range [START..START+N-1]s
 pub const fn range_array<const START:usize,const N:usize>()->[usize;N]{
@@ -46,14 +49,28 @@ pub fn offset_buffer_mut<T>(buf:&mut [u8],idx:usize)->&mut [u8]{
 }
 
 
-/// return range of buffer (start..end) as if each item is size of T
+/// return range of buffer [start..end) as if each item is size of T
 pub fn range_buffer<T>(buf:&[u8],start:usize,end:usize)->&[u8]{
     &buf[start*size_of::<T>()..end*size_of::<T>()]
 }
 
-/// return range of mutable buffer (start..end) as if each item is size of T
+/// return range of mutable buffer [start..end) as if each item is size of T
 pub fn range_buffer_mut<T>(buf:&mut [u8],start:usize,end:usize)->&mut [u8]{
     &mut buf[start*size_of::<T>()..end*size_of::<T>()]
+}
+
+/// Split the buffer such that the first half contain [0,idx) 
+/// and second half have [idx,len) where each index refer 
+/// to item of size_of::<T> size
+pub fn split_buffer<T>(buf:&[u8],idx:usize)->(&[u8],&[u8]){
+    buf.split_at(size_of::<T>()*idx)
+}
+
+/// Split the mutable buffer such that the first half contain [0,idx) 
+/// and second half have [idx,len) where each index refer 
+/// to item of size_of::<T> size
+pub fn split_buffer_mut<T>(buf:&mut [u8],idx:usize)->(&mut [u8],&mut [u8]){
+    buf.split_at_mut(size_of::<T>()*idx)
 }
 
 
@@ -86,6 +103,66 @@ pub fn write_u32_with_idx<T:ByteOrder>(buf: &mut [u8], idx: usize, val: u32) {
 pub fn write_u64_with_idx<T:ByteOrder>(buf: &mut [u8], idx: usize, val: u64) {
     T::write_u64(offset_buffer_mut::<u64>(buf, idx),val);
 }
+
+/// Generate a random string with length within len_range
+pub fn generate_string(len_range:Range<usize>)->String{
+    let mut rng=thread_rng();
+    let len=rng.gen_range(len_range);
+    rng
+    .sample_iter(&Alphanumeric)
+    .take(len)
+    .map(char::from)
+    .collect()
+}
+
+/// Generate a set of unique indexes within the range
+pub fn generate_indexex(range:Range<usize>)->HashSet<usize>{
+    let mut indexes=HashSet::new();
+    let mut rng=thread_rng();
+    while indexes.len()<(range.end-range.start)/2 {
+        indexes.insert(rng.gen_range(range.clone()));
+    };
+
+    indexes
+}
+
+pub fn generate_kv_strategy(kv_len:usize,entries:usize)->impl Strategy<Value = (Vec<(String,String)>,Vec<usize>,Vec<usize>,Vec<(String,String)>)>{
+    let kv_strat=format!(".{{1,{kv_len}}}");
+    let key_strat=prop::string::string_regex(&kv_strat).unwrap();
+    let val_strat=prop::string::string_regex(&kv_strat).unwrap();
+    let input_pairs=prop::collection::vec((key_strat,val_strat), entries/2..=entries);
+    input_pairs.prop_flat_map(|input_pairs|{
+        (
+            prop::collection::vec(0..input_pairs.len(), 0..input_pairs.len()),
+            prop::collection::vec(0..input_pairs.len(), 0..input_pairs.len()),
+            prop::collection::vec(generate_string_range_strategy(), 0..input_pairs.len()),
+            Just(input_pairs),
+        )
+    })
+    .prop_map(|(get,remove,range,input)|{
+        (input,get,remove,range)
+    })
+}
+
+
+//Generate pair of string (s1,s2) where s1<=s2 
+pub fn generate_string_range_strategy()->impl Strategy<Value = (String,String)>{
+    (".{0,20}",".{0,20}")
+    .prop_map(|(first,second)|{
+        match first.cmp(&second){
+            Ordering::Less => {
+                (first,second)
+            },
+            Ordering::Equal => {
+                (first,second)
+            },
+            Ordering::Greater => {
+                (second,first)
+            },
+        }
+    })
+}
+
 
 /// try_into cast that panics if cast fails
 pub fn assert_try_into<T,U>(from:T)->U

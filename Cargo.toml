@@ -6,7 +6,14 @@ edition = "2021"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-anyhow = "1.0.83"
 byteorder = "1.5.0"
+criterion = "0.5.1"
+log = "0.4.21"
+proptest = "1.4.0"
+rand = "0.8.5"
 serde = { version = "1.0.200", features = ["derive"] }
 thiserror = "1.0.60"
+
+[[bench]]
+name = "node_bench"
+harness = false
