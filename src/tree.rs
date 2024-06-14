@@ -254,10 +254,9 @@ where
 
             //     remove_child(&mut parent, key);
 
-            //     // If after removal the node is not empty it means the node was safe
-            //     // and there should be no parent guards
-            //     if parent.len()+(parent.get_flags()&LOWER_PTR_FLAG).min(1) as usize>0{
-            //         assert!(context.is_empty());
+            //     // If the context is not empty then this node should be empty
+            //     if !context.is_empty(){
+            //         assert!(parent.len()==0&&get_low_ptr(&parent).is_none());
             //     }
             
             // }
@@ -284,6 +283,17 @@ where
             let mut new_node:Node<&mut [u8], KC>=Node::new(new_page.get_data_mut());
 
             node.split(&mut new_node);
+            let (new_node_first_key,_)=new_node.first().expect("Expect split to have at least 1 entry on each node");
+            let (old_node_first_key,_)=node.first().expect("Expect split to have at least 1 entry on each node");
+            let push_up_key_val=(new_node_first_key.to_owned(),pg_id);
+            let old_and_push_up= match key.cmp(new_node_first_key){
+                std::cmp::Ordering::Less => {
+                    (node.insert(key, val).unwrap(),Some(push_up_key_val))
+                },
+                std::cmp::Ordering::Greater|std::cmp::Ordering::Equal => {
+                    (new_node.insert(key, val).unwrap(),Some(push_up_key_val))
+                },
+            };
 
             if is_leaf(node){
                 new_node.set_flags(new_node.get_flags()|LEAF_FLAG);
@@ -295,18 +305,11 @@ where
                 node.set_flags(node.get_flags()|RIGHT_PTR_FLAG);
                 node.set_ptrs(0, pg_id);
             }
-            
-            let (new_node_first_key,_)=new_node.first().expect("Expect split to have at least 1 entry on each node");
-            let (old_node_first_key,_)=node.first().expect("Expect split to have at least 1 entry on each node");
-            let push_up_key_val=(new_node_first_key.to_owned(),pg_id);
-            match key.cmp(new_node_first_key){
-                std::cmp::Ordering::Less => {
-                    (node.insert(key, val).unwrap(),Some(push_up_key_val))
-                },
-                std::cmp::Ordering::Greater|std::cmp::Ordering::Equal => {
-                    (new_node.insert(key, val).unwrap(),Some(push_up_key_val))
-                },
+            else{
+                make_first_low_ptr(&mut new_node);
             }
+
+            old_and_push_up
         }
     }
 
@@ -389,6 +392,7 @@ where
     S:MutNodeData,
     KC:KeyCmp
 {
+    assert!(!is_leaf(node));
     match node.upper_bound(Bound::Included(&key)).prev(){
         // Remove key pointing to empty child
         Some((k,v)) => {
@@ -398,19 +402,9 @@ where
         // Remove lower pointer to empty child
         None => {
             let low_ptr=get_low_ptr(node).unwrap();
-            match node.first(){
-                // Move first entry's pid into lower pointer
-                Some((k,v)) => {
-                    let k=k.to_owned();
-                    let new_low=TreeEndian::read_u64(v);
-                    node.remove(&k);
-                    node.set_ptrs(new_low, 0);
-                },
-                // Just toggle lower pointer
-                None => {
-                    node.set_flags(node.get_flags()&!LOWER_PTR_FLAG);
-                },
-            };
+            node.set_flags(node.get_flags()&!LOWER_PTR_FLAG);
+            
+            make_first_low_ptr(node);
             low_ptr
         },
     }
@@ -427,6 +421,18 @@ where
     .prev()
     .map(|(_,v)|{TreeEndian::read_u64(v)})
     .or(get_low_ptr(node))
+}
+
+fn make_first_low_ptr<S,KC>(node:&mut Node<S,KC>)
+where
+    S:MutNodeData,
+    KC:KeyCmp
+{
+    assert!(get_low_ptr(node).is_none());
+    let first=node.first().unwrap().0.to_vec();
+    let low_ptr=TreeEndian::read_u64(&node.remove(&first).unwrap());
+    node.set_ptrs(low_ptr, 0);
+    node.set_flags(node.get_flags()|LOWER_PTR_FLAG);
 }
 
 fn get_low_ptr<S,KC>(node:&Node<S,KC>)->Option<u64>
@@ -631,7 +637,7 @@ mod test{
         for (start,end) in input{
             let my_tree_entries: Vec<(Vec<u8>, Vec<u8>)>=tree.collect_entries(start.as_bytes()..end.as_bytes());
             if !btree.range::<String,_>(start..end).map(|(k,v)|(k.as_bytes(),v.as_bytes())).eq(my_tree_entries.iter().map(|(k,v)|(k.borrow(),v.borrow()))){
-                panic!("Different entries. std_count: {} my_count: {}",btree.range::<String,_>(start..end).count(),my_tree_entries.len());
+                panic!("Different entries. std_count: {} my_count: {} {}",btree.range::<String,_>(start..end).count(),my_tree_entries.len(),tree.get_leaf(start.as_bytes()).is_none());
             }
             
 
