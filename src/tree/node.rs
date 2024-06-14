@@ -6,7 +6,7 @@ use log::warn;
 use proptest::bits::BitSetLike;
 use thiserror::Error;
 
-use crate::{tree::node::utils::{create_key_val_offset, get_key_val_offset}, utils::{offset_buffer_mut, range_buffer_mut, read_u16_with_idx, shift_left_and_write, shift_right_and_write, write_u16_with_idx}};
+use crate::{tree::node::utils::{create_key_val_offset, get_key_val_offset}, utils::{offset_buffer, offset_buffer_mut, range_buffer_mut, read_u16_with_idx, read_u64_with_idx, shift_left_and_write, shift_right_and_write, write_u16_with_idx, write_u64_with_idx}};
 use crate::utils::{assert_try_into, range_array,TupleAssertTryFrom, read_u32_with_idx, write_u32_with_idx};
 
 use self::{iter::{EntryRefIter, EntryRefIterMut, OffsetIterMut}, key_cmp::KeyCmp};
@@ -17,13 +17,13 @@ pub mod iter;
 pub mod cursor;
 
 /*
-//////////////////////////////////////////////////////////////////////////////////////////
-/ flags | len | (key_end_offset1,val_end_offset1),(key_end_offset2,val_end_offset2),     /
-/ (key_end_offset3,val_end_offset3),...,(new_key_end,0)|                                 /
-/                                                                                        /
-/                                                                                        /
-/                                                ...,(val3,key3),(val2,key2),(val1,key1) /
-//////////////////////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////////////////////////
+/ flags | len | ptrs | (key_end_offset1,val_end_offset1),(key_end_offset2,val_end_offset2), /
+/ (key_end_offset3,val_end_offset3),...,(new_key_end,0)|                                    /
+/                                                                                           /
+/                                                                                           /
+/                                                   ...,(val3,key3),(val2,key2),(val1,key1) /
+//////////////////////////////////////////////////////////////////////////////////////////////
 */
 
 const MIN_PG_SIZE:usize=2usize.pow(11);
@@ -31,8 +31,13 @@ const META_DATA_SIZE:usize=size_of::<MetaDataBytes>();
 const OFFSET_SIZE:usize=size_of::<OffsetBytes>();
 const RESERVED_SIZE:usize=META_DATA_SIZE+OFFSET_SIZE;
 
-pub type MetaDataBytes=u32;
-pub type OffsetBytes=u32;
+pub const MIN_ENTRY:usize=4;
+
+// Byte Count: flags:2 len:2 ptrs:16
+pub type NodeFlagBytes=[u8;2];
+pub type NodeLenBytes=[u8;2];
+pub type MetaDataBytes=[u8;20];
+pub type OffsetBytes=[u8;4];
 
 type NodeEndian=BigEndian;
 pub trait NodeData:Deref<Target = [u8]>{}
@@ -67,7 +72,10 @@ where
     T:NodeData,
     KC:KeyCmp
 {   
-    /// Parse the buffer into a node in place
+    /// Parse the buffer into a node in place. This function is considered
+    /// to be very cheap so that self referential structs are not needed
+    /// and data can be parsed each time it needs to perform node operation.
+    /// 
     /// #Panics
     /// This function panics if the slice is not at least MIN_PG_SIZE
     /// or some assumption about buffer content is violated and detected
@@ -77,15 +85,15 @@ where
     /// #Safety
     /// This function assume the data in the buffer is well formed for the node
     pub fn parse(data:T)->Node<T,KC>{
-        assert!(data.len()>=MIN_PG_SIZE,"Expected buffer of at least {} bytes got buffer of {} bytes",MIN_PG_SIZE,data.len());
+        debug_assert!(data.len()>=MIN_PG_SIZE,"Expected buffer of at least {} bytes got buffer of {} bytes",MIN_PG_SIZE,data.len());
     
         //Initialize value bound if length is zero
-        let mut node=Node{
+        let node=Node{
             data,
             phantom:PhantomData
         };
-        let (key_bound,_)=node.key_val_bound();
-        assert_ne!(key_bound,0);
+
+        debug_assert_ne!(node.key_val_bound().0,0);
 
         node
     }
@@ -175,6 +183,12 @@ where
         read_u16_with_idx::<NodeEndian>(&self.data, 0)
     }
 
+    /// Get the extra pointers for the node
+    pub fn get_ptrs(&self)->(u64,u64){
+        let offset_buf=&self.data[size_of::<NodeFlagBytes>()+size_of::<NodeLenBytes>()..];
+        (read_u64_with_idx::<NodeEndian>(offset_buf, 0),read_u64_with_idx::<NodeEndian>(offset_buf, 1))
+    }
+
     /// Check if this node has enough space to insert a entry
     /// with the given size
     pub fn enough_size(&self,size:usize)->bool{
@@ -193,6 +207,35 @@ where
     /// Get number of entries
     pub fn len(&self)->usize{
         read_u16_with_idx::<NodeEndian>(&self.data, 1) as usize
+    }
+    
+    /// Get slice that represents the ith key 
+    /// panics if idx>=self.len()
+    pub fn get_key_slice_at(&self,i:usize)->&[u8]{
+        assert!((i)<self.len(),"Out of bound {i}>={}",self.len());
+        let (key_right,val_right)=self.get_offset_at(i);
+        
+        &self.data[val_right+1..=key_right]
+    }
+
+    /// Get slice that represents the ith value 
+    /// panics if idx>=self.len()
+    pub fn get_val_slice_at(&self,i:usize)->&[u8]{
+        assert!((i)<self.len(),"Out of bound {i}>={}",self.len());
+        let (_,value_right)=self.get_offset_at(i);
+        let (next_key_right,_)=self.get_offset_at(i+1);
+
+        &self.data[next_key_right + 1 ..= value_right]
+    }
+
+    /// Get two slice that represents the ith key/val  
+    /// panics if idx>=self.len()
+    pub fn get_key_val_slices_at(&self,i:usize)->(&[u8],&[u8]){
+        assert!((i)<self.len(),"Out of bound {i}>={}",self.len());
+        let (key_right,val_right)=self.get_offset_at(i);
+        let (next_key_right,_)=self.get_offset_at(i+1);
+
+        (&self.data[val_right + 1 ..= key_right],&self.data[next_key_right+1..=val_right])
     }
 
     /// Get the number of bytes remaining for entry and offset
@@ -317,32 +360,6 @@ where
     /// next key/val.
     fn key_val_bound(&self)->(usize,usize){
         self.get_offset_at(self.len())
-    }
-
-    /// Get slice that represents the ith key 
-    fn get_key_slice_at(&self,i:usize)->&[u8]{
-        assert!((i)<self.len(),"Out of bound {i}>={}",self.len());
-        let (key_right,val_right)=self.get_offset_at(i);
-        
-        &self.data[val_right+1..=key_right]
-    }
-
-    /// Get slice that represents the ith value 
-    fn get_val_slice_at(&self,i:usize)->&[u8]{
-        assert!((i)<self.len(),"Out of bound {i}>={}",self.len());
-        let (_,value_right)=self.get_offset_at(i);
-        let (next_key_right,_)=self.get_offset_at(i+1);
-
-        &self.data[next_key_right + 1 ..= value_right]
-    }
-
-    /// Get two slice that represents the ith key/val  
-    fn get_key_val_slices_at(&self,i:usize)->(&[u8],&[u8]){
-        assert!((i)<self.len(),"Out of bound {i}>={}",self.len());
-        let (key_right,val_right)=self.get_offset_at(i);
-        let (next_key_right,_)=self.get_offset_at(i+1);
-
-        (&self.data[val_right + 1 ..= key_right],&self.data[next_key_right+1..=val_right])
     }
 
     /// Get ith key/val offset 
@@ -569,6 +586,13 @@ where
         write_u16_with_idx::<NodeEndian>(&mut self.data, 0, flag);
     }
 
+    /// Set the ptrs for the node
+    pub fn set_ptrs(&mut self,ptr1:u64,ptr2:u64){
+        let offset_buf=&mut self.data[size_of::<NodeFlagBytes>()+size_of::<NodeLenBytes>()..];
+        write_u64_with_idx::<NodeEndian>(offset_buf, 0, ptr1);
+        write_u64_with_idx::<NodeEndian>(offset_buf, 1, ptr2);
+    }
+
     /// Split the node by bytes so that this node will have
     /// around the first half bytes of entries and the other node 
     /// will have around the second half bytes of entries. 
@@ -581,10 +605,9 @@ where
     /// likely a bug in usage
     /// #Safety
     /// Both nodes are assumed to be well formed
-    pub fn split<D,K>(&mut self,other:&mut Node<D,K>)
+    pub fn split<D>(&mut self,other:&mut Node<D,KC>)
     where
-        D:MutNodeData,
-        K:KeyCmp
+        D:MutNodeData
     {
         assert!(self.len()>=2,"Less than two entry at split");
         assert_eq!(other.len(),0,"Other node not empty");
@@ -627,6 +650,42 @@ where
         assert!(other.enough_size(node_entry_size_limit(other.data.len())));
     }
 
+    /// Copy all entries from other node into current node.
+    /// Panics if the current node don't have enough space.
+    pub fn append<D>(&mut self,other:&mut Node<D,KC>)
+    where
+        D:MutNodeData
+    {
+        let space_used=other.data_space()-other.space_remain();
+        assert!(self.enough_size(space_used));
+        // Just insert everything for now
+        for (k,v) in other.iter(){
+            self.insert(k, v).unwrap();
+        }
+    }
+
+    /// Get mutable slice that represents the ith value 
+    /// panics if idx>=self.len()
+    pub fn get_val_slice_at_mut(&mut self,i:usize)->&mut [u8]{
+        assert!((i)<self.len(),"Out of bound {i}>={}",self.len());
+        let (_,value_right)=self.get_offset_at(i);
+        let (next_key_right,_)=self.get_offset_at(i+1);
+
+        &mut self.data[next_key_right + 1 ..= value_right]
+    }
+
+    /// Get two slice that represents the ith key/val  
+    /// panics if idx>=self.len()
+    pub fn get_key_val_slices_at_mut(&mut self,i:usize)->(&[u8],&mut [u8]){
+        assert!((i)<self.len(),"Out of bound {i}>={}",self.len());
+        let (key_right,val_right)=self.get_offset_at(i);
+        let (next_key_right,_)=self.get_offset_at(i+1);
+
+        let entry=&mut self.data[next_key_right+1..=key_right];
+        let (key,val)=entry.split_at_mut(val_right-(next_key_right+1));
+        (key,val)
+    }
+
     /// Update the length of node on the data page and data structure
     fn set_len(&mut self,len:u16){
         write_u16_with_idx::<NodeEndian>(&mut self.data, 1, len);
@@ -658,27 +717,6 @@ where
         shift_right_and_write(&mut self.data[start..=end+data.len()], data);
     }
 
-    /// Get mutable slice that represents the ith value 
-    fn get_val_slice_at_mut(&mut self,i:usize)->&mut [u8]{
-        assert!((i)<self.len(),"Out of bound {i}>={}",self.len());
-        let (_,value_right)=self.get_offset_at(i);
-        let (next_key_right,_)=self.get_offset_at(i+1);
-
-        &mut self.data[next_key_right + 1 ..= value_right]
-    }
-
-    /// Get two slice that represents the ith key/val  
-    fn get_key_val_slices_at_mut(&mut self,i:usize)->(&[u8],&mut [u8]){
-        assert!((i)<self.len(),"Out of bound {i}>={}",self.len());
-        let (key_right,val_right)=self.get_offset_at(i);
-        let (next_key_right,_)=self.get_offset_at(i+1);
-
-        let entry=&mut self.data[next_key_right+1..=key_right];
-        let (key,val)=entry.split_at_mut(val_right-(next_key_right+1));
-        (key,val)
-    }
-
-
     fn offset_iter(&mut self)->OffsetIterMut{
         OffsetIterMut::new(self)
     }
@@ -692,7 +730,7 @@ where
 /// Get the max number of bytes an entry inclduing
 /// its offset can have given the node size
 pub fn node_entry_size_limit(size:usize)->usize{
-    (size-RESERVED_SIZE)/4-OFFSET_SIZE
+    (size-RESERVED_SIZE)/MIN_ENTRY-OFFSET_SIZE
 }
 
 impl NodeData for &[u8] {}
@@ -723,12 +761,14 @@ mod tests{
     }
 
     #[test]
-    fn test_flags(){
+    fn test_metadata(){
         let mut data=vec![0;4096];
         let mut node:Node<&mut [u8],Lexicological>=Node::new(&mut data);
         assert_eq!(node.get_flags(),0);
         node.set_flags(12);
         assert_eq!(node.get_flags(),12);
+        node.set_ptrs(u64::MAX, 1);
+        assert_eq!(node.get_ptrs(),(u64::MAX, 1));
     }
 
     #[test]
@@ -742,8 +782,8 @@ mod tests{
             assert_eq!(node.space_remain(),4096-META_DATA_SIZE-OFFSET_SIZE-(i+1)*(OFFSET_SIZE+16));
             assert_eq!(node.len(),i+1);
         }
-        assert!(node.insert("abcd".as_bytes(),"abcd".as_bytes()).is_err());
-        assert!(node.insert("ab".as_bytes(),"cd".as_bytes()).is_ok());
+        assert!(node.insert("abcd".repeat(2).as_bytes(),"abcd".repeat(2).as_bytes()).is_err());
+        assert!(node.insert("abcd".as_bytes(),"abcd".as_bytes()).is_ok());
         assert_eq!(node.space_remain(),0);
 
         let (mut counter_k,mut counter_v)=(0,0);
@@ -755,8 +795,8 @@ mod tests{
                 counter_v+=1;
             }
             else {
-                assert_eq!(String::from_utf8(k.to_vec()).unwrap(),"ab");
-                assert_eq!(String::from_utf8(v.to_vec()).unwrap(),"cd");
+                assert_eq!(String::from_utf8(k.to_vec()).unwrap(),"abcd");
+                assert_eq!(String::from_utf8(v.to_vec()).unwrap(),"abcd");
             }
         }
 
